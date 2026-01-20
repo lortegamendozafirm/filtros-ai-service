@@ -1,0 +1,47 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Environment
+.env
+.env.local
+
+# Service Account Keys
+*.json
+
+# Logs
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Testing
+.pytest_cache/
+tests/
+
+# Documentation
+README.md
+docs/
+
+# Temporary
+temp_downloads/
+tmp/

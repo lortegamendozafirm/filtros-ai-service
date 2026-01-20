@@ -1,0 +1,401 @@
+# TDD: FILTROS AI Service
+
+**Versión:** 1.0.0
+**Estado:** Diseño Técnico
+**Stack:** Python 3.11, FastAPI, Google Cloud Run, Vertex AI.
+
+## 1. Resumen Ejecutivo
+
+**FILTROS AI Service** es un microservicio stateless diseñado para automatizar el análisis legal preliminar de casos de inmigración. Su función es recibir solicitudes desde un orquestador (Nexus Legal), descargar evidencias (Intakes en PDF), analizar la viabilidad del caso utilizando modelos generativos (Vertex AI) con contexto legal ("Fundamentos"), y generar un reporte final en Google Docs.
+
+A diferencia de versiones anteriores, este servicio no almacena archivos locales ni usa colas de Google Sheets. Es 100% reactivo vía HTTP, asíncrono en su procesamiento interno y delega la escritura del documento a servicios especializados (Apps Script y m2gdw).
+
+---
+
+## 2. Arquitectura del Sistema
+
+### Diagrama de Alto Nivel
+
+El flujo es orquestado por eventos. FILTROS actúa como el cerebro de análisis y generador de contenido.
+
+```mermaid
+graph TD
+    User((ClickUp)) -->|Webhook| Nexus[Nexus Legal Middleware]
+    Nexus -->|POST /v1/process| Filtros[FILTROS AI Service]
+    
+    subgraph "Google Cloud Platform"
+        Filtros -->|Descarga PDF| Drive[Google Drive API]
+        Filtros -->|Generación| Vertex[Vertex AI Gemini]
+        Filtros -->|Logs/Metrics| Logging[Cloud Logging]
+        Filtros -.->|Check Idempotencia| Firestore[(Firestore - Opcional)]
+    end
+    
+    subgraph "Generación de Documentos"
+        Filtros -->|1. Crear Doc| GAS[Apps Script Executor]
+        GAS -->|Retorna DocID| Filtros
+        Filtros -->|2. Escribir MD| Writer[m2gdw Service]
+        Writer -->|Google Docs API| GDoc[Google Doc Final]
+    end
+
+    Filtros -->|Callback POST Result| Nexus
+
+```
+
+### Diagrama de Secuencia
+
+```mermaid
+sequenceDiagram
+    participant Nexus as Nexus Legal
+    participant API as FILTROS API
+    participant SVC as Service Layer
+    participant VTX as Vertex AI
+    participant GAS as Apps Script
+    participant WRT as m2gdw Writer
+
+    Nexus->>API: POST /v1/process (task_id, link)
+    API-->>Nexus: 202 Accepted (Processing started)
+    Note over API: Background Task Inicia
+    
+    API->>SVC: Ejecutar Pipeline
+    SVC->>SVC: Descargar y extraer texto PDF
+    SVC->>SVC: Cargar Fundamentos (.md)
+    
+    SVC->>VTX: Prompt Análisis (Contexto + Caso)
+    VTX-->>SVC: Reporte en Markdown
+    
+    SVC->>VTX: Prompt Outcome (Basado en análisis)
+    VTX-->>SVC: Outcome (Label)
+    
+    SVC->>GAS: Crear Google Doc vacío
+    GAS-->>SVC: {docId, docUrl}
+    
+    SVC->>WRT: POST /write (docId, markdown)
+    WRT-->>SVC: 200 OK
+    
+    SVC->>Nexus: POST Callback (outcome, links)
+
+```
+
+---
+
+## 3. Estructura del Proyecto
+
+Se recomienda una estructura modular basada en **Domain-Driven Design** simplificado para FastAPI.
+
+```text
+filtros-ai-service/
+├── app/
+│   ├── api/
+│   │   ├── v1/
+│   │   │   └── endpoints.py    # Rutas (POST /process)
+│   │   └── deps.py             # Dependencias (Auth, DB)
+│   ├── core/
+│   │   ├── config.py           # Pydantic Settings (Vars de entorno)
+│   │   └── logging.py          # Configuración de logs estructurados
+│   ├── services/
+│   │   ├── drive_service.py    # Descarga PDF y extracción (PyMuPDF)
+│   │   ├── ai_service.py       # Vertex AI (Gemini) interacción
+│   │   ├── docs_service.py     # Orquestación GAS + m2gdw
+│   │   └── orchestrator.py     # Lógica principal del pipeline
+│   ├── schemas/
+│   │   ├── request.py          # Modelos Pydantic entrada
+│   │   └── response.py         # Modelos Pydantic salida/callback
+│   ├── utils/
+│   │   ├── text_cleaner.py     # Normalización de texto
+│   │   └── fundamentals.py     # Carga de archivos .md de contexto
+│   └── main.py                 # Entrypoint FastAPI
+├── data/
+│   └── fundamentals/           # Carpeta con archivos .md (Legal context)
+├── tests/                      # Pytest
+├── Dockerfile
+├── cloudbuild.yaml
+├── requirements.txt
+└── README.md
+
+```
+
+---
+
+## 4. Contratos de API
+
+### Endpoint de Entrada
+
+Este endpoint inicia el proceso. Dado que el análisis de IA puede tardar (30-60s), se recomienda responder rápido y procesar en *Background Tasks* de FastAPI.
+
+**URL:** `POST /v1/process`
+**Auth:** API Key en Header `X-API-Key` o HMAC validado.
+
+**Request Body (JSON):**
+
+```json
+{
+  "task_id": "8686abcde",
+  "client_name": "Juan Perez",
+  "intake_url": "https://drive.google.com/file/d/123.../view",
+  "mycase_id": "Optional[str]",
+  "nexus_callback_url": "https://nexus-legal.ngrok-free.app/callback/filtros",
+  "metadata": {
+    "case_type": "inmigracion",
+    "priority": "high"
+  }
+}
+
+```
+
+**Response (202 Accepted):**
+
+```json
+{
+  "status": "processing",
+  "request_id": "req_uuid_123456",
+  "message": "Solicitud recibida. El resultado será enviado al callback URL."
+}
+
+```
+
+### Endpoint de Health
+
+**URL:** `GET /health`
+**Response:** `{"status": "ok", "version": "1.0.0"}`
+
+---
+
+## 5. Contrato de Callback (Hacia Nexus Legal)
+
+Una vez finalizado el proceso, FILTROS envía este payload a la `nexus_callback_url`.
+
+**Method:** POST
+**Body (JSON):**
+
+```json
+{
+  "task_id": "8686abcde",
+  "status": "success", 
+  "outcome": "POTENTIAL VAWA",
+  "artifacts": {
+    "doc_id": "1AbC...",
+    "doc_url": "https://docs.google.com/document/d/1AbC..."
+  },
+  "diagnostics": {
+    "processing_time_ms": 45000,
+    "model_version": "gemini-pro-tuned-v1"
+  },
+  "error": null
+}
+
+```
+
+**Códigos de Error (en caso de fallo):**
+
+* `status`: "error"
+* `error`: "DOCUMENT_ACCESS_DENIED", "AI_TIMEOUT", "PARSING_ERROR".
+
+---
+
+## 6. Modelo de Almacenamiento e Idempotencia
+
+**Decisión:** Utilizar **Firestore** (Modo Datastore o Nativo) para control de estado ligero.
+
+* **Por qué:** Cloud Run es stateless. Si Nexus reintenta el webhook (retry policy), no queremos generar el reporte 2 veces ni crear 2 Google Docs.
+* **Implementación:**
+1. Al recibir request: Verificar si `task_id` existe en colección `process_logs`.
+2. Si existe y `status` == 'completed', retornar inmediatamente los datos guardados.
+3. Si no existe, crear documento con `status`='pending' y procesar.
+
+
+
+*(Alternativa simple: Si el presupuesto es cero y el tráfico bajo, confiar en el manejo de errores de Nexus, pero Firestore es la recomendación profesional).*
+
+---
+
+## 7. Diseño de Prompts (Vertex AI)
+
+Se requieren dos llamadas secuenciales para asegurar calidad.
+
+### Prompt 1: Generación de Reporte (Análisis)
+
+*Contexto:* Se inyecta el contenido de los archivos `.md` de la carpeta `data/fundamentals/`.
+*Input:* Texto extraído del PDF.
+
+> **Instrucción de Sistema:** Eres un abogado experto en inmigración de EE.UU. Tu objetivo es analizar transcripciones de clientes y cruzarlas con los fundamentos legales proporcionados.
+> **Formato de Salida:** Debes generar un reporte estrictamente en **Markdown**. Usa encabezados (#, ##), listas y tablas si es necesario. NO uses bloques de código (```) para envolver todo el texto.
+> **Secciones Requeridas:**
+> 1. Resumen de Hechos
+> 2. Análisis de Elegibilidad (Cruce con Fundamentos)
+> 3. Factores de Riesgo / Inadmisibilidad
+> 4. Conclusión Preliminar
+> 
+> 
+
+### Prompt 2: Clasificación (Outcome)
+
+*Input:* El reporte generado en el paso anterior.
+
+> **Instrucción:** Basado EXCLUSIVAMENTE en el análisis anterior, clasifica el caso en una de las siguientes categorías exactas. Responde SOLO con la etiqueta.
+> **Lista de Outcomes (Enum):**
+> * Pass
+> * DENIED
+> * NO INFO_SOLO QUEST
+> * POTENTIAL VAWA
+> * POTENTIAL VISA T
+> * NON VAWA
+> * NQ-NOT QAL RELATION
+> * (Resto de la lista definida en tu script...)
+> 
+> 
+
+---
+
+## 8. Integración con Google Drive (Intake)
+
+La lógica debe manejar URLs de Drive y IDs directos.
+
+1. **Extracción de ID:** Usar regex robusto para sacar el File ID de URLs tipo `/open?id=`, `/file/d/`, etc.
+2. **Librería:** `fitz` (PyMuPDF).
+3. **Flujo:**
+* Autenticar `google.oauth2.service_account` con scopes `drive.readonly`.
+* Descargar archivo a `/tmp/input.pdf` (memoria efímera de Cloud Run).
+* `doc = fitz.open(path)` -> iterar páginas -> `page.get_text()`.
+* Limpieza: Eliminar headers/footers repetitivos si es necesario.
+
+
+
+---
+
+## 9. Integración: Apps Script + m2gdw
+
+Esta es la clave para eliminar la dependencia de OAuth de usuario local.
+
+### A) Crear Doc (Apps Script)
+
+Se debe desplegar un Script de Apps Script como "Web App" (Ejecutar como: Propietario del Doc, Acceso: Cualquiera con el token/secreto).
+
+**Request a Apps Script:**
+
+```json
+{
+  "action": "create",
+  "title": "Analisis - Juan Perez",
+  "folder_id": "ID_CARPETA_DESTINO", 
+  "editors": ["docs-writer-sa@ortega-473114.iam.gserviceaccount.com"] 
+}
+
+```
+
+*Nota: Es CRÍTICO que el Apps Script comparta el documento con la Service Account del servicio `m2gdw` inmediatamente al crearlo, de lo contrario `m2gdw` fallará al intentar escribir.*
+
+### B) Escribir Contenido (m2gdw)
+
+Usar el servicio ya existente.
+
+**Request a m2gdw:**
+
+```json
+{
+  "documentId": "DOC_ID_RETORNADO_POR_APPS_SCRIPT",
+  "content": "MARKDOWN_GENERADO_POR_VERTEX",
+  "append": false
+}
+
+```
+
+---
+
+## 10. Variables de Entorno y Secretos
+
+Configurar en Cloud Run (preferiblemente referenciando Secret Manager):
+
+| Variable | Descripción | Ejemplo / Valor |
+| --- | --- | --- |
+| `PROJECT_ID` | ID del proyecto GCP | `woven-operative-419903` |
+| `LOCATION` | Región | `us-central1` |
+| `VERTEX_ENDPOINT_ID` | ID del modelo ajustado | `5192293029079154688` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path al JSON de SA (Montado como volumen) | `/secrets/sa_key.json` |
+| `APPS_SCRIPT_URL` | Webhook para crear docs | `https://script.google.com/...` |
+| `M2GDW_URL` | URL del servicio escritor | `https://m2gdw-...run.app/api/v1/write` |
+| `TARGET_FOLDER_ID` | ID carpeta Drive destino | `1YAtsrp...` |
+| `API_KEY` | Clave para proteger este servicio | `(random string)` |
+
+---
+
+## 11. Deployment (Cloud Build)
+
+### Dockerfile Recomendado
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Instalar dependencias del sistema para PyMuPDF si hacen falta (usualmente wheels bastan)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar código y datos
+COPY app /app/app
+COPY data /app/data 
+
+# Usuario no root por seguridad
+RUN addgroup --system app && adduser --system --group app
+USER app
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+```
+
+### Comandos de Despliegue
+
+```bash
+# 1. Construir
+gcloud builds submit --tag gcr.io/woven-operative-419903/filtros-ai-service:v1
+
+# 2. Desplegar
+gcloud run deploy filtros-ai-service \
+  --image gcr.io/woven-operative-419903/filtros-ai-service:v1 \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated \ 
+  --memory 2Gi \
+  --cpu 2 \
+  --timeout 300s \
+  --set-env-vars PROJECT_ID=woven-operative-419903,LOCATION=us-central1
+
+```
+
+*Nota: `allow-unauthenticated` es necesario si Nexus llama desde internet, pero debes validar la seguridad a nivel de aplicación (API Key).*
+
+---
+
+## 12. Riesgos y Mitigaciones
+
+1. **Timeouts:** El análisis de IA + descarga + escritura puede exceder el timeout del webhook de ClickUp (normalmente 30s).
+* *Mitigación:* Arquitectura asíncrona. FILTROS responde "202 Accepted" en <2 segundos y procesa en background.
+
+
+2. **Permisos de Escritura:** La Service Account de `m2gdw` no puede escribir en un doc creado por un usuario personal a menos que se comparta explícitamente.
+* *Mitigación:* El Apps Script **debe** tener una línea `DriveApp.getFileById(docId).addEditor('docs-writer-sa@...')`.
+
+
+3. **Alucinaciones del Modelo:** Gemini puede inventar hechos.
+* *Mitigación:* Temperature baja (`0.1`) y el uso de "Grounding" (Fundamentos) en el prompt. Incluir disclaimer en el documento generado.
+
+
+4. **Archivos Grandes:** PDFs de >50 páginas pueden saturar la memoria o el contexto del token.
+* *Mitigación:* Limitar lectura a las primeras N páginas o implementar chunking si el caso es muy complejo (para V1, limitar a ~30k caracteres).
+
+
+
+---
+
+## 13. Checklist de Pruebas
+
+* [ ] **Unitarias:** `test_extract_id_from_url` (probar 5 formatos de link de drive).
+* [ ] **Unitarias:** `test_sanitize_filename`.
+* [ ] **Integración:** Mockear Vertex AI y verificar que el orquestador llama a Apps Script y luego a m2gdw.
+* [ ] **E2E:** Enviar un request manual con Postman -> Verificar Logs -> Verificar creación de Doc en Drive -> Verificar contenido.
+* [ ] **Carga:** Enviar 5 requests simultáneos para verificar concurrencia de Cloud Run.
+
