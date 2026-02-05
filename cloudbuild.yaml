@@ -1,13 +1,13 @@
 steps:
-  # Build the container image
+  # 1. Construir la imagen de Docker
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'gcr.io/$PROJECT_ID/filtros-ai-service:$COMMIT_SHA', '.']
-  
-  # Push the container image to Container Registry
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/filtros-ai-service:$BUILD_ID', '.']
+
+  # 2. Subir la imagen al registro
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/filtros-ai-service:$COMMIT_SHA']
-  
-  # Deploy container image to Cloud Run
+    args: ['push', 'gcr.io/$PROJECT_ID/filtros-ai-service:$BUILD_ID']
+
+  # 3. Desplegar en Cloud Run con TODA la configuración
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -15,20 +15,22 @@ steps:
       - 'deploy'
       - 'filtros-ai-service'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/filtros-ai-service:$COMMIT_SHA'
+      - 'gcr.io/$PROJECT_ID/filtros-ai-service:$BUILD_ID'
       - '--region'
       - 'us-central1'
       - '--platform'
       - 'managed'
       - '--allow-unauthenticated'
+      - '--service-account'
+      - 'ajustado-and-rag@woven-operative-419903.iam.gserviceaccount.com'
       - '--memory'
       - '2Gi'
       - '--cpu'
       - '2'
       - '--timeout'
-      - '300s'
+      - '1500' # Tiempo suficiente para procesos pesados de IA
       - '--set-env-vars'
-      - 'PROJECT_ID=$PROJECT_ID,LOCATION=us-central1'
+      - 'PROJECT_ID=woven-operative-419903,LOCATION=us-central1,VERTEX_ENDPOINT_ID=5192293029079154688,APPS_SCRIPT_URL=https://script.google.com/macros/s/AKfycbwZNe5k5FHGZTx9IOCEaR_94dzKLe1bxVi96VcGmYyBgYw3cDcfj5UqB_gftYtww785/exec,M2GDW_URL=https://m2gdw-223080314602.us-central1.run.app/api/v1/write,TARGET_FOLDER_ID=1YAtsrp5raJRRHep4PUa6a_q08QEgObrH,API_KEY=tu-api-key-real,AI_MAX_RETRIES=3'
 
 images:
-  - 'gcr.io/$PROJECT_ID/filtros-ai-service:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/filtros-ai-service:$BUILD_ID'

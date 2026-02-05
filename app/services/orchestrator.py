@@ -1,10 +1,9 @@
+# app/services/orchestrator.py
 """Main orchestrator for processing pipeline."""
-
 import time
 import httpx
 import json
 from typing import Dict, Any, Optional
-
 from google.auth.credentials import Credentials 
 
 from app.core.config import settings
@@ -17,156 +16,75 @@ from app.schemas.response import CallbackPayload, ProcessStatus, ArtifactsInfo, 
 
 logger = get_logger(__name__)
 
-
 class ProcessingOrchestrator:
-    """Orchestrates the complete case processing pipeline."""
-    
     def __init__(self, credentials: Optional[Credentials] = None):
-        """Initialize orchestrator with services."""
         self.credentials = credentials
         self.drive_service = DriveService(credentials)
         self.ai_service = AIService(credentials)
         self.docs_service = DocsService()
     
-    async def process_case(
-        self,
-        task_id: str,
-        client_name: str,
-        intake_url: str,
-        callback_url: str
-    ) -> None:
-        """Process a complete case from intake to callback."""
-
+    async def process_case(self, task_id: str, client_name: str, intake_url: str, callback_url: str) -> None:
         start_time = time.time()
-        
-        # Set up logging context
         extra = {"task_id": task_id}
-        logger.info(f"Starting case processing for task: {task_id}", extra=extra)
         
+        # --- PASO 1: RESERVAR/CREAR EL DOC (Validación temprana) ---
+        # Si esto falla, lanzará una excepción y el endpoint la capturará.
+        logger.info("Step 1: Creating placeholder Google Doc", extra=extra)
+        # Nota: Usamos un título temporal o definitivo si ya lo tenemos
+        doc_info = await self.docs_service.create_document(
+            title=f"Análisis en proceso - {client_name}", 
+            editors="docs-writer-sa@ortega-473114.iam.gserviceaccount.com"
+        )
+        doc_id = doc_info["doc_id"]
+        doc_url = doc_info["doc_url"]
+
         try:
-            # Step 1: Download and extract PDF text
-            logger.info("Step 1: Downloading and extracting PDF", extra=extra)
+            # --- PASO 2: DESCARGA Y EXTRACCIÓN ---
+            logger.info("Step 2: Downloading and extracting PDF", extra=extra)
             transcript_text = self.drive_service.download_and_extract(intake_url)
-            
             if not transcript_text:
                 raise Exception("No text extracted from PDF")
             
-            # Step 2: Load legal fundamentals
-            logger.info("Step 2: Loading legal fundamentals", extra=extra)
-            fundamentos = load_fundamentals()
-            
-            # Step 3: Generate AI analysis
+            # --- PASO 3: IA ---
             logger.info("Step 3: Generating AI analysis", extra=extra)
             outcome, analysis_text = self.ai_service.generate_analysis(
-                transcript_text,
-                fundamentos,
-                client_name
+                transcript_text, load_fundamentals(), client_name
             )
-            # ✨ MEJORA DE VISIBILIDAD: Ver el resultado inmediatamente
-            logger.info(f"⚖️ AI Outcome decided: {outcome}", extra=extra)
             
-            # Step 4: Create and populate Google Doc
-            logger.info("Step 4: Creating Google Doc", extra=extra)
-            doc_info = await self.docs_service.generate_report_document(
-                client_name,
-                outcome,
-                analysis_text
-            )
-            # ✨ MEJORA DE VISIBILIDAD: Link clickeable en logs
-            logger.info(f"📄 Doc created: {doc_info.get('doc_url')}", extra=extra)
-            
-            # Calculate processing time
+            # --- PASO 4: ESCRIBIR RESULTADO EN EL DOC ---
+            # Ya tenemos el doc_id desde el paso 1, solo escribimos.
+            logger.info("Step 4: Writing analysis to Doc", extra=extra)
+            full_content = f"# Análisis de Filtro - {client_name} ({outcome})\n\n{analysis_text}"
+            await self.docs_service.write_content(doc_id, full_content)
+
+            # --- PASO 5: CALLBACK ÉXITO ---
             processing_time_ms = int((time.time() - start_time) * 1000)
-            
-            # Step 5: Send success callback
-            logger.info("Step 5: Sending success callback", extra=extra)
-            await self._send_callback(
-                callback_url,
-                CallbackPayload(
-                    task_id=task_id,
-                    status=ProcessStatus.SUCCESS,
-                    outcome=outcome,
-                    artifacts=ArtifactsInfo(
-                        doc_id=doc_info["doc_id"],
-                        doc_url=doc_info["doc_url"]
-                    ),
-                    diagnostics=DiagnosticsInfo(
-                        processing_time_ms=processing_time_ms,
-                        version="gemini-pro-tuned-v1" # <--- ¡Bien corregido!
-                    )
-                )
-            )
-            
-            logger.info(
-                f"Case processing completed successfully in {processing_time_ms}ms",
-                extra=extra
-            )
-            
+            await self._send_callback(callback_url, CallbackPayload(
+                task_id=task_id,
+                status=ProcessStatus.SUCCESS,
+                outcome=outcome,
+                artifacts=ArtifactsInfo(doc_id=doc_id, doc_url=doc_url),
+                diagnostics=DiagnosticsInfo(processing_time_ms=processing_time_ms, version="gemini-pro-tuned-v1")
+            ))
+
         except Exception as e:
-            # Calculate processing time
-            processing_time_ms = int((time.time() - start_time) * 1000)
-            
-            logger.error(f"Case processing failed: {e}", extra=extra, exc_info=True)
-            
-            # Determine error type
-            error_message = str(e)
-            if "file ID" in error_message.lower():
-                error_code = "DOCUMENT_ACCESS_DENIED"
-            elif "timeout" in error_message.lower():
-                error_code = "AI_TIMEOUT"
-            elif "extract" in error_message.lower() or "pdf" in error_message.lower():
-                error_code = "PARSING_ERROR"
-            else:
-                error_code = "PROCESSING_ERROR"
-            
-            # Send error callback
-            try:
-                await self._send_callback(
-                    callback_url,
-                    CallbackPayload(
-                        task_id=task_id,
-                        status=ProcessStatus.ERROR,
-                        outcome=None,
-                        artifacts=None,
-                        diagnostics=DiagnosticsInfo(
-                            processing_time_ms=processing_time_ms,
-                            version="gemini-pro-tuned-v1"
-                        ),
-                        error=f"{error_code}: {error_message}"
-                    )
-                )
-            except Exception as callback_error:
-                logger.error(
-                    f"Failed to send error callback: {callback_error}",
-                    extra=extra
-                )
-    
-    async def _send_callback(self, callback_url: str, payload: CallbackPayload) -> None:
-        """Send callback to Nexus Legal."""
+            await self._handle_processing_error(task_id, e, start_time, callback_url, extra)
+            raise e # Esto es correcto, permite que el endpoint capture el error
+
+    async def _handle_processing_error(self, task_id, error, start_time, callback_url, extra):
+        processing_time_ms = int((time.time() - start_time) * 1000)
         try:
-            payload_data = payload.model_dump()
-            
-            # Estos logs son excelentes para debug
-            logger.info(f"🚀 Iniciando Callback a: {callback_url}")
-            logger.info(f"📦 Payload a enviar: {json.dumps(payload_data)}")
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    callback_url,
-                    json=payload_data
-                )
-                logger.info(f"⬅️ Respuesta del Callback (Status): {response.status_code}")
-                
-                # Opcional: Si la respuesta es muy larga, podrías querer truncarla
-                # pero para depurar ahora está bien completa.
-                logger.info(f"⬅️ Respuesta del Callback (Body): {response.text}")
-                
-                response.raise_for_status()
-            
-            logger.info("Callback sent successfully")
-            
+            await self._send_callback(callback_url, CallbackPayload(
+                task_id=task_id,
+                status=ProcessStatus.ERROR,
+                diagnostics=DiagnosticsInfo(processing_time_ms=processing_time_ms, version="gemini-pro-tuned-v1"),
+                error=str(error)
+            ))
         except Exception as e:
-            # Aquí ya tienes el logger.error que lo atrapará en process_case, 
-            # pero está bien dejarlo si quieres logging específico del método.
-            logger.error(f"Error sending callback inner: {e}")
-            raise
+            logger.error(f"Could not send error callback. error:{e}")
+            
+
+    async def _send_callback(self, callback_url: str, payload: CallbackPayload) -> None:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(callback_url, json=payload.model_dump())
+            response.raise_for_status()

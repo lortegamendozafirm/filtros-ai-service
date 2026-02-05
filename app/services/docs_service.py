@@ -10,7 +10,6 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
- 
 class DocsService:
     """Service for creating and writing Google Docs."""
     
@@ -21,6 +20,7 @@ class DocsService:
         if not settings.APPS_SCRIPT_URL:
             raise ValueError("APPS_SCRIPT_URL no está configurada")
 
+        # Lógica para extraer un solo email si viene una lista
         email_sa = editors[0] if isinstance(editors, list) and editors else editors
         if isinstance(email_sa, list): 
             email_sa = ""
@@ -30,9 +30,13 @@ class DocsService:
             "carpetaId": settings.TARGET_FOLDER_ID,
             "emailSA": email_sa
         }
+        
+        # CONFIGURACIÓN CRÍTICA DE RED:
+        # connect=10.0: Si no hay respuesta TCP en 10s, abortar (evita colgarse infinitamente).
+        # read=60.0: Apps Script es lento generando docs, damos hasta 60s para esperar el JSON de éxito.
+        timeout_config = httpx.Timeout(60.0, connect=10.0)
 
-        # --- LÓGICA DE REINTENTOS (NUEVO) ---
-        max_retries = 3
+        max_retries = 5
         last_exception = None
 
         for attempt in range(max_retries):
@@ -42,8 +46,15 @@ class DocsService:
                 else:
                     logger.info(f"Creating Google Doc via Apps Script: {title}")
 
-                # Aumentamos un poco el timeout y usamos un cliente fresco cada vez
-                async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                # AJUSTES DEL CLIENTE HTTP:
+                # http2=False: VITAL. Cloud Run a veces falla negociando HTTP/2 con Google Scripts. Forzamos HTTP/1.1.
+                # follow_redirects=True: VITAL. Apps Script devuelve un 302 siempre.
+                async with httpx.AsyncClient(
+                    timeout=timeout_config, 
+                    follow_redirects=True, 
+                    http2=False,
+                    verify=True # Mantenemos seguridad SSL
+                ) as client:
                     response = await client.post(
                         settings.APPS_SCRIPT_URL,
                         json=payload
@@ -51,7 +62,7 @@ class DocsService:
                     response.raise_for_status()
                     result = response.json()
                 
-                # Validación de respuesta lógica
+                # Validación de respuesta lógica del script
                 if result.get("status") != "success":
                     raise Exception(f"Apps Script logical error: {result.get('message')}")
                     
@@ -68,23 +79,19 @@ class DocsService:
                     "doc_url": doc_url
                 }
 
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as e:
-                # Capturamos errores de red transitorios
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
                 last_exception = e
-                logger.warning(f"⚠️ Fallo de red en intento {attempt + 1}: {type(e).__name__} - {e}")
+                # Backoff exponencial más agresivo: 2, 4, 8, 16 segundos
+                wait_time = 2 ** attempt 
+                logger.warning(f"⚠️ Fallo de red. Reintentando en {wait_time}s...")
+                await asyncio.sleep(wait_time)
                 
-                # Esperamos un poco antes de reintentar (Backoff exponencial: 1s, 2s, 4s...)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1 * (attempt + 1))
-                else:
-                    logger.error("❌ Se agotaron los reintentos para conectar con Apps Script.")
-
             except Exception as e:
-                # Otros errores (lógicos, validación) no se reintentan
-                logger.error(f"FATAL: Error no recuperable creando documento: {e}", exc_info=True)
+                # Si es un error de lógica de Apps Script (ej. cuota excedida), 
+                # lanzamos un error que podamos capturar arriba.
                 raise e
 
-        # Si salimos del bucle, lanzamos el último error de red capturado
+        # Si salimos del bucle por agotamiento de intentos
         if last_exception:
             logger.error(f"FATAL: Error creating document after {max_retries} attempts.", exc_info=True)
             raise last_exception
@@ -99,6 +106,7 @@ class DocsService:
                 "markdown_content": markdown_content
             }
             
+            # Timeout generoso para escritura (m2gdw)
             async with httpx.AsyncClient(timeout=200.0) as client:
                 response = await client.post(
                     settings.M2GDW_URL,
