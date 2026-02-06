@@ -274,7 +274,7 @@ Los logs están estructurados en formato JSON para compatibilidad con Cloud Logg
 
 ## Licencia
 
-Propietario: Ortega Legal Services
+Propietario: Ortega EO
 
 ## Contacto
 
